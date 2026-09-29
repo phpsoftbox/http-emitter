@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace PhpSoftBox\Http\Emitter\Tests;
 
-use PhpSoftBox\Http\Emitter\Exception\HeadersAlreadySentException;
 use PhpSoftBox\Http\Emitter\SapiEmitter;
 use PhpSoftBox\Http\Message\Response;
 use PhpSoftBox\Http\Message\Stream;
@@ -15,15 +14,19 @@ use PHPUnit\Framework\Attributes\RunInSeparateProcess;
 use PHPUnit\Framework\Attributes\Test;
 use PHPUnit\Framework\TestCase;
 
-use function flush;
+use function dirname;
+use function fclose;
 use function function_exists;
 use function header_remove;
-use function headers_sent;
 use function http_response_code;
-use function ob_flush;
 use function ob_get_clean;
 use function ob_start;
+use function proc_close;
+use function proc_open;
 use function str_repeat;
+use function stream_get_contents;
+
+use const PHP_BINARY;
 
 #[CoversClass(SapiEmitter::class)]
 #[CoversMethod(SapiEmitter::class, 'emit')]
@@ -179,22 +182,42 @@ final class SapiEmitterTest extends TestCase
     /**
      * Проверяет явную ошибку вместо частичного ответа после начала вывода.
      *
+     * Вывод до emit() воспроизводится в отдельном процессе PHP: внутри PHPUnit вывод теста буферизуется раннером,
+     * и заголовки там не считаются отправленными.
+     *
      * @see SapiEmitter::emit()
      */
     #[Test]
-    #[RunInSeparateProcess]
-    #[PreserveGlobalState(false)]
     public function alreadySentHeadersCauseException(): void
     {
-        self::expectException(HeadersAlreadySentException::class);
+        $script = <<<'PHP'
+            require $argv[1];
 
-        echo 'premature output';
-        ob_flush();
-        flush();
+            echo 'premature output';
+            flush();
 
-        self::assertTrue(headers_sent());
+            try {
+                new PhpSoftBox\Http\Emitter\SapiEmitter()->emit(new PhpSoftBox\Http\Message\Response());
+            } catch (PhpSoftBox\Http\Emitter\Exception\HeadersAlreadySentException) {
+                fwrite(STDERR, 'headers-already-sent');
+            }
+            PHP;
 
-        new SapiEmitter()->emit(new Response());
+        $process = proc_open(
+            [PHP_BINARY, '-r', $script, dirname(__DIR__) . '/vendor/autoload.php'],
+            [1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+            $pipes,
+        );
+        self::assertIsResource($process);
+
+        $stdout = stream_get_contents($pipes[1]);
+        $stderr = stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        proc_close($process);
+
+        self::assertSame('premature output', $stdout);
+        self::assertSame('headers-already-sent', $stderr);
     }
 
     private function emitAndCapture(Response $response): string
